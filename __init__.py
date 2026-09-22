@@ -661,6 +661,7 @@ def _load_wanvideo_nodes():
         Wav2VecModelLoader,
         WanVideoUni3C_ControlnetLoader,
         DownloadAndLoadWav2VecModel,
+        WanVideoAnimateEmbeds,  # <-- Added import
     )
 
     return {
@@ -684,6 +685,7 @@ def _load_wanvideo_nodes():
         "Wav2VecModelLoaderMultiGPU": Wav2VecModelLoader,
         "WanVideoUni3C_ControlnetLoaderMultiGPU": WanVideoUni3C_ControlnetLoader,
         "DownloadAndLoadWav2VecModelMultiGPU": DownloadAndLoadWav2VecModel,
+        "WanVideoAnimateEmbedsMultiGPU": WanVideoAnimateEmbeds,  # <-- Added node mapping
     }
 
 NODE_CLASS_MAPPINGS = {

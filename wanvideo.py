@@ -155,15 +155,16 @@ class WanVideoSampler:
         compute_device_to_be_patched = mm.get_torch_device()
         sampler_module.device = compute_device_to_be_patched
 
-        transformer = model.model.diffusion_model
-        transformer_options = model.model_options.get("transformer_options", {})
+        # Check block swapping
+        transformer = getattr(getattr(model, "model", None), "diffusion_model", None)
+        transformer_options = getattr(model, "model_options", {}).get("transformer_options", {})
         block_swap_args = transformer_options.get("block_swap_args")
 
         multi_gpu_block_swap = block_swap_args is not None and "swap_device" in block_swap_args
         offload_device_to_be_patched = None
         if multi_gpu_block_swap:
             swap_label = block_swap_args.get("swap_device")
-            logger.info(f"[MultiGPU WanVideoWrapper][WanVideoSamplerMultiGPU] block swap enabled, swap device: {swap_label}")
+            logger.info(f"[MultiGPU WanVideoWrapper][WanVideoSampler] block swap enabled, swap device: {swap_label}")
             offload_device_to_be_patched = torch.device(str(swap_label))
             sampler_module.offload_device = offload_device_to_be_patched
 
@@ -409,7 +410,7 @@ class WanVideoVAELoader:
         original_loader = NODE_CLASS_MAPPINGS["WanVideoVAELoader"]()
         vae_model = original_loader.loadmodel(model_name, precision, compile_args)
 
-        return vae_model, load_device
+        return vae_model[0], load_device
 
 class WanVideoTinyVAELoader:
     @classmethod
@@ -861,3 +862,134 @@ class WanVideoUni3C_ControlnetLoader:
 
         original_loader = NODE_CLASS_MAPPINGS["WanVideoUni3C_ControlnetLoader"]()
         return original_loader.loadmodel(model, base_precision, load_device, quantization, attention_mode, compile_args)
+
+class WanVideoAnimateEmbeds:
+    @classmethod
+    def INPUT_TYPES(s):
+        devices = get_device_list()
+        default_device = devices[1] if len(devices) > 1 else devices[0]
+        return {
+            "required": {
+                "vae": ("WANVAE",),
+                "load_device": (devices, {"default": default_device}),
+                "width": ("INT", {"default": 832, "min": 64, "max": 8096, "step": 8, "tooltip": "Width of the image to encode"}),
+                "height": ("INT", {"default": 480, "min": 64, "max": 8096, "step": 8, "tooltip": "Height of the image to encode"}),
+                "num_frames": ("INT", {"default": 81, "min": 1, "max": 10000, "step": 4, "tooltip": "Number of frames to encode"}),
+                "force_offload": ("BOOLEAN", {"default": True}),
+                "frame_window_size": ("INT", {"default": 77, "min": 1, "max": 10000, "step": 1, "tooltip": "Number of frames to use for temporal attention window"}),
+                "colormatch": (
+                    [
+                        'disabled',
+                        'mkl',
+                        'hm',
+                        'reinhard',
+                        'mvgd',
+                        'hm-mvgd-hm',
+                        'hm-mkl-hm',
+                    ], {"default": 'disabled', "tooltip": "Color matching method to use between the windows"}
+                ),
+                "pose_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.001, "tooltip": "Additional multiplier for the pose"}),
+                "face_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.001, "tooltip": "Additional multiplier for the face"}),
+            },
+            "optional": {
+                "clip_embeds": ("WANVIDIMAGE_CLIPEMBEDS", {"tooltip": "Clip vision encoded image"}),
+                "ref_images": ("IMAGE", {"tooltip": "Image to encode"}),
+                "pose_images": ("IMAGE", {"tooltip": "end frame"}),
+                "face_images": ("IMAGE", {"tooltip": "end frame"}),
+                "bg_images": ("IMAGE", {"tooltip": "background images"}),
+                "mask": ("MASK", {"tooltip": "mask"}),
+                "start_ref_image": ("IMAGE", {"tooltip": "start ref image"}),
+                "tiled_vae": ("BOOLEAN", {"default": False, "tooltip": "Use tiled VAE encoding for reduced memory use"}),
+            }
+        }
+
+    RETURN_TYPES = ("WANVIDIMAGE_EMBEDS",)
+    RETURN_NAMES = ("image_embeds",)
+    FUNCTION = "process"
+    CATEGORY = "multigpu/WanVideoWrapper"
+    DESCRIPTION = "MultiGPU-aware WanAnimate encoder that directs VAE encoding to the selected device."
+
+    def process(self, vae, load_device, width, height, num_frames, force_offload, frame_window_size, colormatch,
+                pose_strength, face_strength, **kwargs):
+        from . import set_current_device
+
+        original_node = NODE_CLASS_MAPPINGS["WanVideoAnimateEmbeds"]()
+        encoder_module = inspect.getmodule(original_node)
+
+        orig_device = encoder_module.device
+        orig_offload = encoder_module.offload_device
+
+        # Switch context to the target compute device (e.g. cuda:1)
+        set_current_device(load_device)
+        target_torch_device = mm.get_torch_device()
+        encoder_module.device = target_torch_device
+        encoder_module.offload_device = mm.unet_offload_device()
+
+        # Unwrap VAE if passed as a tuple from another loader
+        actual_vae = vae[0] if isinstance(vae, (tuple, list)) else vae
+
+        try:
+            return original_node.process(
+                actual_vae, width, height, num_frames, force_offload, frame_window_size, colormatch,
+                pose_strength, face_strength, **kwargs
+            )
+        finally:
+            encoder_module.device = orig_device
+            encoder_module.offload_device = orig_offload
+
+class WanVideoDecode:
+    @classmethod
+    def INPUT_TYPES(s):
+        devices = get_device_list()
+        default_device = devices[1] if len(devices) > 1 else devices[0]
+        return {
+            "required": {
+                "vae": ("WANVAE",),
+                "load_device": (devices, {"default": default_device}),
+                "samples": ("LATENT",),
+                "enable_vae_tiling": ("BOOLEAN", {"default": False}),
+                "tile_x": ("INT", {"default": 272, "min": 40, "max": 2048, "step": 8}),
+                "tile_y": ("INT", {"default": 272, "min": 40, "max": 2048, "step": 8}),
+                "tile_stride_x": ("INT", {"default": 144, "min": 32, "max": 2040, "step": 8}),
+                "tile_stride_y": ("INT", {"default": 128, "min": 32, "max": 2040, "step": 8}),
+            },
+            "optional": {
+                "normalization": (["default", "minmax"], {"advanced": True}),
+            }
+        }
+
+    @classmethod
+    def VALIDATE_INPUTS(s, tile_x, tile_y, tile_stride_x, tile_stride_y):
+        if tile_x <= tile_stride_x:
+            return "Tile width must be larger than the tile stride width."
+        if tile_y <= tile_stride_y:
+            return "Tile height must be larger than the tile stride height."
+        return True
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("images",)
+    FUNCTION = "decode"
+    CATEGORY = "multigpu/WanVideoWrapper"
+
+    def decode(self, vae, load_device, samples, enable_vae_tiling, tile_x, tile_y, tile_stride_x, tile_stride_y, normalization="default"):
+        from . import set_current_device
+
+        original_decode = NODE_CLASS_MAPPINGS["WanVideoDecode"]()
+        decode_module = inspect.getmodule(original_decode)
+        original_module_device = decode_module.device
+        original_module_offload = decode_module.offload_device
+
+        set_current_device(load_device)
+        compute_device_to_be_patched = mm.get_torch_device()
+        decode_module.device = compute_device_to_be_patched
+        decode_module.offload_device = mm.unet_offload_device()
+
+        actual_vae = vae[0] if isinstance(vae, (tuple, list)) else vae
+
+        try:
+            return original_decode.decode(
+                actual_vae, samples, enable_vae_tiling, tile_x, tile_y, tile_stride_x, tile_stride_y, normalization
+            )
+        finally:
+            decode_module.device = original_module_device
+            decode_module.offload_device = original_module_offload
