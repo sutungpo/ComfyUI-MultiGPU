@@ -143,9 +143,12 @@ class WanVideoSampler:
     DESCRIPTION = "MultiGPU-aware sampler that ensures correct device for each model"
 
     def process(self, model, compute_device, **kwargs):
-        from . import set_current_device, get_current_device
+        from . import set_current_device
+        from .device_utils import get_device_list
 
-        original_global_device = get_current_device()
+        devices = get_device_list()
+        default_base_device = devices[0]
+
         original_sampler = NODE_CLASS_MAPPINGS["WanVideoSampler"]()
         sampler_module = inspect.getmodule(original_sampler)
 
@@ -156,7 +159,6 @@ class WanVideoSampler:
         compute_device_to_be_patched = mm.get_torch_device()
         sampler_module.device = compute_device_to_be_patched
 
-        # Check block swapping
         transformer = getattr(getattr(model, "model", None), "diffusion_model", None)
         transformer_options = getattr(model, "model_options", {}).get("transformer_options", {})
         block_swap_args = transformer_options.get("block_swap_args")
@@ -165,7 +167,6 @@ class WanVideoSampler:
         offload_device_to_be_patched = None
         if multi_gpu_block_swap:
             swap_label = block_swap_args.get("swap_device")
-            logger.info(f"[MultiGPU WanVideoWrapper][WanVideoSampler] block swap enabled, swap device: {swap_label}")
             offload_device_to_be_patched = torch.device(str(swap_label))
             sampler_module.offload_device = offload_device_to_be_patched
 
@@ -178,7 +179,7 @@ class WanVideoSampler:
         finally:
             sampler_module.device = original_module_device
             sampler_module.offload_device = original_module_offload_device
-            set_current_device(original_global_device)
+            set_current_device(default_base_device)
 
 class WanVideoTextEncode:
     @classmethod
@@ -567,9 +568,12 @@ class WanVideoDecode:
     CATEGORY = "multigpu/WanVideoWrapper"
 
     def decode(self, vae, load_device, samples, enable_vae_tiling, tile_x, tile_y, tile_stride_x, tile_stride_y, normalization="default"):
-        from . import set_current_device, get_current_device
-        
-        original_global_device = get_current_device()
+        from . import set_current_device, cuda_device_guard
+        from .device_utils import get_device_list
+
+        devices = get_device_list()
+        default_base_device = devices[0]  # usually "cuda:0"
+
         original_decode = NODE_CLASS_MAPPINGS["WanVideoDecode"]()
         decode_module = inspect.getmodule(original_decode)
         original_module_device = decode_module.device
@@ -583,13 +587,16 @@ class WanVideoDecode:
         actual_vae = vae[0] if isinstance(vae, (tuple, list)) else vae
 
         try:
-            return original_decode.decode(
-                actual_vae, samples, enable_vae_tiling, tile_x, tile_y, tile_stride_x, tile_stride_y, normalization
-            )
+            with cuda_device_guard(compute_device_to_be_patched, reason="WanVideoDecodeMultiGPU"):
+                return original_decode.decode(
+                    actual_vae, samples, enable_vae_tiling, tile_x, tile_y, tile_stride_x, tile_stride_y, normalization
+                )
         finally:
             decode_module.device = original_module_device
             decode_module.offload_device = original_module_offload
-            set_current_device(original_global_device)
+            # Reset ComfyUI's global device back to the primary GPU (cuda:0)
+            # so vanilla downstream nodes like GIMM-VFI find mm.get_torch_device() == cuda:0
+            set_current_device(default_base_device)
 
 
 class WanVideoVACEEncode:
@@ -919,21 +926,22 @@ class WanVideoAnimateEmbeds:
 
     def process(self, vae, load_device, width, height, num_frames, force_offload, frame_window_size, colormatch,
                 pose_strength, face_strength, **kwargs):
-        from . import set_current_device, get_current_device
-        original_global_device = get_current_device()
+        from . import set_current_device
+        from .device_utils import get_device_list
+
+        devices = get_device_list()
+        default_base_device = devices[0]
+
         original_node = NODE_CLASS_MAPPINGS["WanVideoAnimateEmbeds"]()
         encoder_module = inspect.getmodule(original_node)
 
         orig_device = encoder_module.device
         orig_offload = encoder_module.offload_device
 
-        # Switch context to the target compute device (e.g. cuda:1)
         set_current_device(load_device)
-        target_torch_device = mm.get_torch_device()
-        encoder_module.device = target_torch_device
+        encoder_module.device = mm.get_torch_device()
         encoder_module.offload_device = mm.unet_offload_device()
 
-        # Unwrap VAE if passed as a tuple from another loader
         actual_vae = vae[0] if isinstance(vae, (tuple, list)) else vae
 
         try:
@@ -944,4 +952,4 @@ class WanVideoAnimateEmbeds:
         finally:
             encoder_module.device = orig_device
             encoder_module.offload_device = orig_offload
-            set_current_device(original_global_device)
+            set_current_device(default_base_device)
