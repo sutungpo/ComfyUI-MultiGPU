@@ -535,26 +535,23 @@ class WanVideoImageToVideoEncode:
 class WanVideoDecode:
     @classmethod
     def INPUT_TYPES(s):
-        return {"required": {
-                    "vae": ("WANVAE",),
-                    "load_device": ("MULTIGPUDEVICE",),
-                    "samples": ("LATENT",),
-                    "enable_vae_tiling": ("BOOLEAN", {"default": False, "tooltip": (
-                        "Drastically reduces memory use but will introduce seams at tile stride boundaries. "
-                        "The location and number of seams is dictated by the tile stride size. "
-                        "The visibility of seams can be controlled by increasing the tile size. "
-                        "Seams become less obvious at 1.5x stride and are barely noticeable at 2x stride size. "
-                        "Which is to say if you use a stride width of 160, the seams are barely noticeable with a tile width of 320."
-                    )}),
-                    "tile_x": ("INT", {"default": 272, "min": 40, "max": 2048, "step": 8, "tooltip": "Tile width in pixels. Smaller values use less VRAM but will make seams more obvious."}),
-                    "tile_y": ("INT", {"default": 272, "min": 40, "max": 2048, "step": 8, "tooltip": "Tile height in pixels. Smaller values use less VRAM but will make seams more obvious."}),
-                    "tile_stride_x": ("INT", {"default": 144, "min": 32, "max": 2040, "step": 8, "tooltip": "Tile stride width in pixels. Smaller values use less VRAM but will introduce more seams."}),
-                    "tile_stride_y": ("INT", {"default": 128, "min": 32, "max": 2040, "step": 8, "tooltip": "Tile stride height in pixels. Smaller values use less VRAM but will introduce more seams."}),
-                    },
-                    "optional": {
-                        "normalization": (["default", "minmax"], {"advanced": True}),
-                    }
-                }
+        devices = get_device_list()
+        default_device = devices[1] if len(devices) > 1 else devices[0]
+        return {
+            "required": {
+                "vae": ("WANVAE",),
+                "load_device": (devices, {"default": default_device}),
+                "samples": ("LATENT",),
+                "enable_vae_tiling": ("BOOLEAN", {"default": False}),
+                "tile_x": ("INT", {"default": 272, "min": 40, "max": 2048, "step": 8}),
+                "tile_y": ("INT", {"default": 272, "min": 40, "max": 2048, "step": 8}),
+                "tile_stride_x": ("INT", {"default": 144, "min": 32, "max": 2040, "step": 8}),
+                "tile_stride_y": ("INT", {"default": 128, "min": 32, "max": 2040, "step": 8}),
+            },
+            "optional": {
+                "normalization": (["default", "minmax"], {"advanced": True}),
+            }
+        }
 
     @classmethod
     def VALIDATE_INPUTS(s, tile_x, tile_y, tile_stride_x, tile_stride_y):
@@ -570,20 +567,29 @@ class WanVideoDecode:
     CATEGORY = "multigpu/WanVideoWrapper"
 
     def decode(self, vae, load_device, samples, enable_vae_tiling, tile_x, tile_y, tile_stride_x, tile_stride_y, normalization="default"):
-        from . import set_current_device
-
+        from . import set_current_device, get_current_device
+        
+        original_global_device = get_current_device()
         original_decode = NODE_CLASS_MAPPINGS["WanVideoDecode"]()
         decode_module = inspect.getmodule(original_decode)
         original_module_device = decode_module.device
+        original_module_offload = decode_module.offload_device
 
         set_current_device(load_device)
         compute_device_to_be_patched = mm.get_torch_device()
         decode_module.device = compute_device_to_be_patched
+        decode_module.offload_device = mm.unet_offload_device()
+
+        actual_vae = vae[0] if isinstance(vae, (tuple, list)) else vae
 
         try:
-            return original_decode.decode(vae[0], samples, enable_vae_tiling, tile_x, tile_y, tile_stride_x, tile_stride_y, normalization)
+            return original_decode.decode(
+                actual_vae, samples, enable_vae_tiling, tile_x, tile_y, tile_stride_x, tile_stride_y, normalization
+            )
         finally:
             decode_module.device = original_module_device
+            decode_module.offload_device = original_module_offload
+            set_current_device(original_global_device)
 
 
 class WanVideoVACEEncode:
@@ -938,63 +944,4 @@ class WanVideoAnimateEmbeds:
         finally:
             encoder_module.device = orig_device
             encoder_module.offload_device = orig_offload
-            set_current_device(original_global_device)
-
-class WanVideoDecode:
-    @classmethod
-    def INPUT_TYPES(s):
-        devices = get_device_list()
-        default_device = devices[1] if len(devices) > 1 else devices[0]
-        return {
-            "required": {
-                "vae": ("WANVAE",),
-                "load_device": (devices, {"default": default_device}),
-                "samples": ("LATENT",),
-                "enable_vae_tiling": ("BOOLEAN", {"default": False}),
-                "tile_x": ("INT", {"default": 272, "min": 40, "max": 2048, "step": 8}),
-                "tile_y": ("INT", {"default": 272, "min": 40, "max": 2048, "step": 8}),
-                "tile_stride_x": ("INT", {"default": 144, "min": 32, "max": 2040, "step": 8}),
-                "tile_stride_y": ("INT", {"default": 128, "min": 32, "max": 2040, "step": 8}),
-            },
-            "optional": {
-                "normalization": (["default", "minmax"], {"advanced": True}),
-            }
-        }
-
-    @classmethod
-    def VALIDATE_INPUTS(s, tile_x, tile_y, tile_stride_x, tile_stride_y):
-        if tile_x <= tile_stride_x:
-            return "Tile width must be larger than the tile stride width."
-        if tile_y <= tile_stride_y:
-            return "Tile height must be larger than the tile stride height."
-        return True
-
-    RETURN_TYPES = ("IMAGE",)
-    RETURN_NAMES = ("images",)
-    FUNCTION = "decode"
-    CATEGORY = "multigpu/WanVideoWrapper"
-
-    def decode(self, vae, load_device, samples, enable_vae_tiling, tile_x, tile_y, tile_stride_x, tile_stride_y, normalization="default"):
-        from . import set_current_device, get_current_device
-        
-        original_global_device = get_current_device()
-        original_decode = NODE_CLASS_MAPPINGS["WanVideoDecode"]()
-        decode_module = inspect.getmodule(original_decode)
-        original_module_device = decode_module.device
-        original_module_offload = decode_module.offload_device
-
-        set_current_device(load_device)
-        compute_device_to_be_patched = mm.get_torch_device()
-        decode_module.device = compute_device_to_be_patched
-        decode_module.offload_device = mm.unet_offload_device()
-
-        actual_vae = vae[0] if isinstance(vae, (tuple, list)) else vae
-
-        try:
-            return original_decode.decode(
-                actual_vae, samples, enable_vae_tiling, tile_x, tile_y, tile_stride_x, tile_stride_y, normalization
-            )
-        finally:
-            decode_module.device = original_module_device
-            decode_module.offload_device = original_module_offload
             set_current_device(original_global_device)
