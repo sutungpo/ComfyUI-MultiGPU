@@ -579,6 +579,24 @@ def _patch_comfy_kitchen_dlpack_device_guard():
     logger.info("[MultiGPU] Applied comfy_kitchen CUDA DLPack device guard patch (P2P-aware)")
     return True
 
+@contextmanager
+def scoped_device_context(device, reason="scoped_node"):
+    """
+    Context manager that temporarily applies a device to both:
+    1. ComfyUI's logical current_device / mm.get_torch_device()
+    2. PyTorch's physical CUDA driver context via cuda_device_guard
+    Guarantees full restoration upon exit, preventing global state leaks.
+    """
+    original_device = get_current_device()
+    target_device = _coerce_torch_device(device) or device
+    if target_device is not None:
+        set_current_device(target_device)
+    try:
+        with cuda_device_guard(target_device, reason=reason):
+            yield
+    finally:
+        set_current_device(original_device)
+
 logger.info("[MultiGPU Core Patching] Patching mm.get_torch_device, mm.text_encoder_device, mm.unet_offload_device")
 logger.info(f"[MultiGPU DEBUG] Initial current_device: {current_device}")
 logger.info(f"[MultiGPU DEBUG] Initial current_text_encoder_device: {current_text_encoder_device}")
