@@ -143,11 +143,8 @@ class WanVideoSampler:
     DESCRIPTION = "MultiGPU-aware sampler that ensures correct device for each model"
 
     def process(self, model, compute_device, **kwargs):
-        from . import set_current_device
-        from .device_utils import get_device_list
-
-        devices = get_device_list()
-        default_base_device = devices[0]
+        from . import set_current_device, get_current_device
+        saved_global_device = get_current_device()
 
         original_sampler = NODE_CLASS_MAPPINGS["WanVideoSampler"]()
         sampler_module = inspect.getmodule(original_sampler)
@@ -179,7 +176,7 @@ class WanVideoSampler:
         finally:
             sampler_module.device = original_module_device
             sampler_module.offload_device = original_module_offload_device
-            set_current_device(default_base_device)
+            set_current_device(saved_global_device)
 
 class WanVideoTextEncode:
     @classmethod
@@ -568,11 +565,9 @@ class WanVideoDecode:
     CATEGORY = "multigpu/WanVideoWrapper"
 
     def decode(self, vae, load_device, samples, enable_vae_tiling, tile_x, tile_y, tile_stride_x, tile_stride_y, normalization="default"):
-        from . import set_current_device, cuda_device_guard
-        from .device_utils import get_device_list
+        from . import set_current_device, cuda_device_guard, get_current_device
 
-        devices = get_device_list()
-        default_base_device = devices[0]  # usually "cuda:0"
+        saved_global_device = get_current_device()
 
         original_decode = NODE_CLASS_MAPPINGS["WanVideoDecode"]()
         decode_module = inspect.getmodule(original_decode)
@@ -596,7 +591,7 @@ class WanVideoDecode:
             decode_module.offload_device = original_module_offload
             # Reset ComfyUI's global device back to the primary GPU (cuda:0)
             # so vanilla downstream nodes like GIMM-VFI find mm.get_torch_device() == cuda:0
-            set_current_device(default_base_device)
+            set_current_device(saved_global_device)
 
 
 class WanVideoVACEEncode:
@@ -926,11 +921,8 @@ class WanVideoAnimateEmbeds:
 
     def process(self, vae, load_device, width, height, num_frames, force_offload, frame_window_size, colormatch,
                 pose_strength, face_strength, **kwargs):
-        from . import set_current_device
-        from .device_utils import get_device_list
-
-        devices = get_device_list()
-        default_base_device = devices[0]
+        from . import set_current_device, get_current_device
+        saved_global_device = get_current_device()
 
         original_node = NODE_CLASS_MAPPINGS["WanVideoAnimateEmbeds"]()
         encoder_module = inspect.getmodule(original_node)
@@ -952,4 +944,4 @@ class WanVideoAnimateEmbeds:
         finally:
             encoder_module.device = orig_device
             encoder_module.offload_device = orig_offload
-            set_current_device(default_base_device)
+            set_current_device(saved_global_device)
